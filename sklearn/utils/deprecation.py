@@ -1,6 +1,7 @@
 import warnings
 import functools
 
+
 __all__ = ["deprecated"]
 
 
@@ -23,14 +24,14 @@ class deprecated:
 
     Parameters
     ----------
-    extra : string
-          to be added to the deprecation messages
+    extra : str, default=''
+          To be added to the deprecation messages.
     """
 
     # Adapted from https://wiki.python.org/moin/PythonDecoratorLibrary,
     # but with many changes.
 
-    def __init__(self, extra=''):
+    def __init__(self, extra=""):
         self.extra = extra
 
     def __call__(self, obj):
@@ -59,17 +60,18 @@ class deprecated:
         if self.extra:
             msg += "; %s" % self.extra
 
-        # FIXME: we should probably reset __new__ for full generality
-        init = cls.__init__
+        new = cls.__new__
 
-        def wrapped(*args, **kwargs):
-            warnings.warn(msg, category=DeprecationWarning)
-            return init(*args, **kwargs)
-        cls.__init__ = wrapped
+        def wrapped(cls, *args, **kwargs):
+            warnings.warn(msg, category=FutureWarning)
+            if new is object.__new__:
+                return object.__new__(cls)
+            return new(cls, *args, **kwargs)
 
-        wrapped.__name__ = '__init__'
-        wrapped.__doc__ = self._update_doc(init.__doc__)
-        wrapped.deprecated_original = init
+        cls.__new__ = wrapped
+
+        wrapped.__name__ = "__new__"
+        wrapped.deprecated_original = new
 
         return cls
 
@@ -82,10 +84,9 @@ class deprecated:
 
         @functools.wraps(fun)
         def wrapped(*args, **kwargs):
-            warnings.warn(msg, category=DeprecationWarning)
+            warnings.warn(msg, category=FutureWarning)
             return fun(*args, **kwargs)
 
-        wrapped.__doc__ = self._update_doc(wrapped.__doc__)
         # Add a reference to the wrapped function so that we can introspect
         # on function arguments in Python 2 (already works in Python 3)
         wrapped.__wrapped__ = fun
@@ -96,27 +97,20 @@ class deprecated:
         msg = self.extra
 
         @property
+        @functools.wraps(prop)
         def wrapped(*args, **kwargs):
-            warnings.warn(msg, category=DeprecationWarning)
+            warnings.warn(msg, category=FutureWarning)
             return prop.fget(*args, **kwargs)
 
         return wrapped
 
-    def _update_doc(self, olddoc):
-        newdoc = "DEPRECATED"
-        if self.extra:
-            newdoc = "%s: %s" % (newdoc, self.extra)
-        if olddoc:
-            newdoc = "%s\n\n%s" % (newdoc, olddoc)
-        return newdoc
-
 
 def _is_deprecated(func):
-    """Helper to check if func is wraped by our deprecated decorator"""
-    closures = getattr(func, '__closure__', [])
+    """Helper to check if func is wrapped by our deprecated decorator"""
+    closures = getattr(func, "__closure__", [])
     if closures is None:
         closures = []
-    is_deprecated = ('deprecated' in ''.join([c.cell_contents
-                                              for c in closures
-                     if isinstance(c.cell_contents, str)]))
+    is_deprecated = "deprecated" in "".join(
+        [c.cell_contents for c in closures if isinstance(c.cell_contents, str)]
+    )
     return is_deprecated

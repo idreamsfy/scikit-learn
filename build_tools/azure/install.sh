@@ -1,87 +1,133 @@
 #!/bin/bash
 
 set -e
+set -x
+
+# defines the get_dep and show_installed_libraries functions
+source build_tools/shared.sh
 
 UNAMESTR=`uname`
+CCACHE_LINKS_DIR="/tmp/ccache"
 
-if [[ "$UNAMESTR" == "Darwin" ]]; then
-    # install OpenMP not present by default on osx
-    HOMEBREW_NO_AUTO_UPDATE=1 brew install libomp
-
-    # enable OpenMP support for Apple-clang
-    export CC=/usr/bin/clang
-    export CXX=/usr/bin/clang++
-    export CPPFLAGS="$CPPFLAGS -Xpreprocessor -fopenmp"
-    export CFLAGS="$CFLAGS -I/usr/local/opt/libomp/include"
-    export CXXFLAGS="$CXXFLAGS -I/usr/local/opt/libomp/include"
-    export LDFLAGS="$LDFLAGS -L/usr/local/opt/libomp/lib -lomp"
-    export DYLD_LIBRARY_PATH=/usr/local/opt/libomp/lib
-fi
-
-make_conda() {
-    TO_INSTALL="$@"
-    conda create -n $VIRTUALENV --yes $TO_INSTALL
-    source activate $VIRTUALENV
+setup_ccache() {
+    CCACHE_BIN=`which ccache || echo ""`
+    if [[ "${CCACHE_BIN}" == "" ]]; then
+        echo "ccache not found, skipping..."
+    elif [[ -d "${CCACHE_LINKS_DIR}" ]]; then
+        echo "ccache already configured, skipping..."
+    else
+        echo "Setting up ccache with CCACHE_DIR=${CCACHE_DIR}"
+        mkdir ${CCACHE_LINKS_DIR}
+        which ccache
+        for name in gcc g++ cc c++ clang clang++ i686-linux-gnu-gcc i686-linux-gnu-c++ x86_64-linux-gnu-gcc x86_64-linux-gnu-c++ x86_64-apple-darwin13.4.0-clang x86_64-apple-darwin13.4.0-clang++; do
+        ln -s ${CCACHE_BIN} "${CCACHE_LINKS_DIR}/${name}"
+        done
+        export PATH="${CCACHE_LINKS_DIR}:${PATH}"
+        ccache -M 256M
+    fi
 }
 
-if [[ "$DISTRIB" == "conda" ]]; then
-    TO_INSTALL="python=$PYTHON_VERSION pip pytest pytest-cov \
-                numpy=$NUMPY_VERSION scipy=$SCIPY_VERSION \
-                cython=$CYTHON_VERSION joblib=$JOBLIB_VERSION"
+pre_python_environment_install() {
+    if [[ "$DISTRIB" == "ubuntu" ]]; then
+        sudo apt-get update
+        sudo apt-get install python3-scipy python3-matplotlib \
+             libatlas3-base libatlas-base-dev python3-virtualenv ccache
 
-    if [[ "$INSTALL_MKL" == "true" ]]; then
-        TO_INSTALL="$TO_INSTALL mkl"
+    elif [[ "$DISTRIB" == "debian-32" ]]; then
+        apt-get update
+        apt-get install -y python3-dev python3-numpy python3-scipy \
+                python3-matplotlib libatlas3-base libatlas-base-dev \
+                python3-virtualenv python3-pandas ccache git
+
+    elif [[ "$DISTRIB" == "conda-pypy3" ]]; then
+        # need compilers
+        apt-get -yq update
+        apt-get -yq install build-essential
+    fi
+
+}
+
+python_environment_install_and_activate() {
+    if [[ "$DISTRIB" == "conda"* ]]; then
+        conda update -n base conda -y
+        conda install -c conda-forge "$(get_dep conda-lock min)" -y
+        conda-lock install --name $VIRTUALENV $LOCK_FILE
+        source activate $VIRTUALENV
+
+    elif [[ "$DISTRIB" == "ubuntu" || "$DISTRIB" == "debian-32" ]]; then
+        python3 -m virtualenv --system-site-packages --python=python3 $VIRTUALENV
+        source $VIRTUALENV/bin/activate
+        pip install -r "${LOCK_FILE}"
+
+    elif [[ "$DISTRIB" == "pip-nogil" ]]; then
+        python -m venv $VIRTUALENV
+        source $VIRTUALENV/bin/activate
+        pip install -r "${LOCK_FILE}"
+    fi
+
+    if [[ "$DISTRIB" == "conda-pip-scipy-dev" ]]; then
+        echo "Installing development dependency wheels"
+        dev_anaconda_url=https://pypi.anaconda.org/scipy-wheels-nightly/simple
+        pip install --pre --upgrade --timeout=60 --extra-index $dev_anaconda_url numpy pandas scipy
+        echo "Installing Cython from latest sources"
+        pip install https://github.com/cython/cython/archive/master.zip
+        echo "Installing joblib from latest sources"
+        pip install https://github.com/joblib/joblib/archive/master.zip
+        echo "Installing pillow from latest sources"
+        pip install https://github.com/python-pillow/Pillow/archive/main.zip
+
+    elif [[ "$DISTRIB" == "pip-nogil" ]]; then
+        apt-get -yq update
+        apt-get install -yq ccache
+
+    fi
+}
+
+scikit_learn_install() {
+    setup_ccache
+    show_installed_libraries
+
+    # Set parallelism to 3 to overlap IO bound tasks with CPU bound tasks on CI
+    # workers with 2 cores when building the compiled extensions of scikit-learn.
+    export SKLEARN_BUILD_PARALLEL=3
+
+    if [[ "$UNAMESTR" == "Darwin" && "$SKLEARN_TEST_NO_OPENMP" == "true" ]]; then
+        # Without openmp, we use the system clang. Here we use /usr/bin/ar
+        # instead because llvm-ar errors
+        export AR=/usr/bin/ar
+        # Make sure omp.h is not present in the conda environment, so that
+        # using an unprotected "cimport openmp" will make this build fail. At
+        # the time of writing (2023-01-13), on OSX, blas (mkl or openblas)
+        # brings in openmp so that you end up having the omp.h include inside
+        # the conda environment.
+        find $CONDA_PREFIX -name omp.h -delete -print
+    fi
+
+    if [[ "$UNAMESTR" == "Linux" ]]; then
+        # FIXME: temporary fix to link against system libraries on linux
+        # https://github.com/scikit-learn/scikit-learn/issues/20640
+        export LDFLAGS="$LDFLAGS -Wl,--sysroot=/"
+    fi
+
+    # TODO use a specific variable for this rather than using a particular build ...
+    if [[ "$DISTRIB" == "conda-pip-latest" ]]; then
+        # Check that pip can automatically build scikit-learn with the build
+        # dependencies specified in pyproject.toml using an isolated build
+        # environment:
+        pip install --verbose --editable .
     else
-        TO_INSTALL="$TO_INSTALL nomkl"
+        # Use the pre-installed build dependencies and build directly in the
+        # current environment.
+        python setup.py develop
     fi
 
-    if [[ -n "$PANDAS_VERSION" ]]; then
-        TO_INSTALL="$TO_INSTALL pandas=$PANDAS_VERSION"
-    fi
+    ccache -s
+}
 
-    if [[ -n "$PYAMG_VERSION" ]]; then
-        TO_INSTALL="$TO_INSTALL pyamg=$PYAMG_VERSION"
-    fi
+main() {
+    pre_python_environment_install
+    python_environment_install_and_activate
+    scikit_learn_install
+}
 
-    if [[ -n "$PILLOW_VERSION" ]]; then
-        TO_INSTALL="$TO_INSTALL pillow=$PILLOW_VERSION"
-    fi
-
-    if [[ -n "$MATPLOTLIB_VERSION" ]]; then
-        TO_INSTALL="$TO_INSTALL matplotlib=$MATPLOTLIB_VERSION"
-    fi
-
-    if [[ "$PYTHON_VERSION" == "*" ]]; then
-        TO_INSTALL="$TO_INSTALL pytest-xdist"
-    fi
-
-	make_conda $TO_INSTALL
-
-elif [[ "$DISTRIB" == "ubuntu" ]]; then
-    sudo add-apt-repository --remove ppa:ubuntu-toolchain-r/test
-    sudo apt-get install python3-scipy python3-matplotlib libatlas3-base libatlas-base-dev libatlas-dev python3-virtualenv
-    python3 -m virtualenv --system-site-packages --python=python3 $VIRTUALENV
-    source $VIRTUALENV/bin/activate
-    python -m pip install pytest pytest-cov cython joblib==$JOBLIB_VERSION
-fi
-
-if [[ "$COVERAGE" == "true" ]]; then
-    python -m pip install coverage codecov
-fi
-
-if [[ "$TEST_DOCSTRINGS" == "true" ]]; then
-    python -m pip install sphinx numpydoc  # numpydoc requires sphinx
-fi
-
-python --version
-python -c "import numpy; print('numpy %s' % numpy.__version__)"
-python -c "import scipy; print('scipy %s' % scipy.__version__)"
-python -c "\
-try:
-    import pandas
-    print('pandas %s' % pandas.__version__)
-except ImportError:
-    print('pandas not installed')
-"
-pip list
-python setup.py develop
+main

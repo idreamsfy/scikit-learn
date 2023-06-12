@@ -2,9 +2,9 @@
 
 set -e
 
-if [[ "$DISTRIB" == "conda" ]]; then
+if [[ "$DISTRIB" =~ ^conda.* ]]; then
     source activate $VIRTUALENV
-elif [[ "$DISTRIB" == "ubuntu" ]]; then
+elif [[ "$DISTRIB" == "ubuntu" || "$DISTRIB" == "pip-nogil" ]]; then
     source $VIRTUALENV/bin/activate
 fi
 
